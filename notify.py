@@ -4,7 +4,7 @@ import discord
 from discord.ext import commands, tasks
 from flask import Flask
 import spotipy
-from spotipy.oauth2 import SpotifyOAuth
+from spotipy.oauth2 import SpotifyClientCredentials
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -46,15 +46,11 @@ SPOTIFY_PLAYLIST_ID = extract_playlist_id(RAW_PLAYLIST_ID)
 # Spotify API Setup (Read-Only Scopes)
 cache_file_path = os.path.join(os.path.dirname(__file__), ".cache")
 
-sp_oauth = SpotifyOAuth(
+auth_manager = SpotifyClientCredentials(
     client_id=os.getenv("SPOTIPY_CLIENT_ID"),
     client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
-    redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI"),
-    scope="playlist-read-private playlist-read-collaborative",
-    cache_path=cache_file_path,
-    open_browser=False
 )
-sp = spotipy.Spotify(auth_manager=sp_oauth)
+sp = spotipy.Spotify(auth_manager=auth_manager)
 
 # Discord Bot Setup
 intents = discord.Intents.default()
