@@ -4,6 +4,8 @@ A lightweight, automated Discord bot that monitors a Spotify playlist in real ti
 
 Deployed on **Render** (as a free Web Service) and kept online 24/7 using **cron-job.org**.
 
+Also includes a standalone **backfill script** that scans a channel's entire message history for Spotify track links and adds any it finds straight to the playlist — handy for catching the playlist up on links people posted before the bot existed.
+
 ---
 
 ## 📋 Features
@@ -12,6 +14,7 @@ Deployed on **Render** (as a free Web Service) and kept online 24/7 using **cron
 - 💬 **Rich Discord Embeds:** Automatically posts track details including song title, artist name, direct Spotify link, and album artwork.
 - ⚡ **24/7 Uptime (Set & Forget):** Runs on Render with a lightweight background Flask endpoint pinged every 5 minutes by `cron-job.org` to prevent idle sleeping.
 - 🔐 **Headless OAuth Authentication:** Utilizes a persistent Spotify Refresh Token so server deployments never require manual browser authentication or interactive terminal input.
+- 🔎 **Channel Backfill:** One-off script that scans full channel history for Spotify track links (including auto-embeds) and adds any missing tracks to the playlist, skipping ones already there.
 
 ---
 
@@ -31,12 +34,13 @@ Before getting started, make sure you have:
 
 ```text
 .
-├── notify.py              # Main bot application (Discord bot + Flask keep-alive webserver)
-├── get_refresh_token.py   # One-time helper script to generate Spotify Refresh Token
-├── requirements.txt       # Python dependencies
-├── Procfile               # Web server process configuration for cloud host
-├── .env.example           # Example environment variables template
-└── README.md              # Documentation
+├── notify.py                          # Main bot application (Discord bot + Flask keep-alive webserver)
+├── backfill_playlist_from_channel.py  # One-off script: scans channel history for Spotify links and adds them to the playlist
+├── get_refresh_token.py               # One-time helper script to generate Spotify Refresh Token
+├── requirements.txt                   # Python dependencies
+├── Procfile                           # Web server process configuration for cloud host
+├── .env.example                       # Example environment variables template
+└── README.md                          # Documentation
 ```
 
 ---
@@ -51,7 +55,8 @@ Before getting started, make sure you have:
 | `SPOTIPY_CLIENT_ID` | Spotify App Client ID | `e878b520806e46a...` |
 | `SPOTIPY_CLIENT_SECRET` | Spotify App Client Secret | `a891b93e70fe17...` |
 | `SPOTIPY_REDIRECT_URI` | Authorized Redirect URI configured in Spotify Dashboard | `http://127.0.0.1:8080/callback` |
-| `SPOTIFY_REFRESH_TOKEN` | Stored long-lived Spotify OAuth refresh token | `AQB3x8Z...` |
+| `SPOTIFY_REFRESH_TOKEN` | Stored long-lived Spotify OAuth refresh token (used by `notify.py`, read-only scopes) | `AQB3x8Z...` |
+| `SPOTIPY_CACHE_PATH` | *(Optional)* Cache file path used by `backfill_playlist_from_channel.py` for its own OAuth token | `.cache-backfill` |
 | `PORT` | Web server port (automatically populated on Render) | `8080` |
 
 ---
@@ -138,7 +143,7 @@ Free instances on Render spin down after 15 minutes of inbound HTTP inactivity. 
 
 ## 🔐 How Spotify Authentication Works
 
-Because cloud hosting platforms (like Render) operate in "headless" environments without a browser, this bot uses a persistent **Two-Phase OAuth 2.0 Flow**.
+Because cloud hosting platforms (like Render) operate in "headless" environments without a browser, `notify.py` uses a persistent **Two-Phase OAuth 2.0 Flow**.
 
 ### Phase 1: Local Authorization (One-Time Setup)
 1. Running `get_refresh_token.py` locally triggers a browser redirect to Spotify.
@@ -150,6 +155,53 @@ Because cloud hosting platforms (like Render) operate in "headless" environments
 1. The bot runs on Render with `open_browser=False`.
 2. It uses the `SPOTIFY_REFRESH_TOKEN` from your environment variables to authenticate.
 3. Whenever the 60-minute Access Token expires, `spotipy` automatically uses the Refresh Token to fetch a brand new Access Token in the background without requiring user intervention.
+
+`backfill_playlist_from_channel.py` works differently since it's meant to be run locally/interactively rather than deployed headlessly: it lets `spotipy` manage its own OAuth flow and token cache directly (see next section), so there's no manual refresh-token copy/paste step for it.
+
+---
+
+## 🔁 Backfilling the Playlist from Channel History
+
+`backfill_playlist_from_channel.py` is a standalone, run-it-when-you-need-it script (not a long-running bot) that:
+
+1. Connects to Discord and reads the **entire** message history of `DISCORD_CHANNEL_ID`.
+2. Extracts Spotify track links from both raw message text and Discord's auto-generated link embeds — matches `open.spotify.com/track/<id>` (including localized `intl-xx` URLs) and `spotify:track:<id>` URIs.
+3. Fetches the playlist's current contents so it can skip tracks that are already there.
+4. Adds all newly found tracks to `SPOTIFY_PLAYLIST_ID` in batches of 100 (Spotify's per-request limit).
+
+### Spotify Auth for the Backfill Script
+
+Adding tracks requires write scopes (`playlist-modify-public playlist-modify-private`), which the read-only `SPOTIFY_REFRESH_TOKEN` used by `notify.py` doesn't have. Rather than juggling a second refresh token by hand, this script handles its own auth:
+
+- **First run:** since it's run locally, `spotipy` opens a browser tab for you to log in and approve the modify scopes.
+- **Every run after that:** `spotipy` reads its cached token from `SPOTIPY_CACHE_PATH` (default `.cache-backfill`) and silently refreshes it as needed — no browser, no manual token copying.
+
+This cache file is separate from anything `notify.py`/`get_refresh_token.py` use, so it won't interfere with your production bot's credentials. Make sure `.cache-backfill` (or whatever path you set) is in `.gitignore` — it contains a live OAuth token.
+
+### Requirements
+
+- The bot needs the **Message Content Intent** enabled in the Discord Developer Portal (same requirement as `notify.py`).
+- The bot needs **View Channel** and **Read Message History** permissions in the target channel.
+- `SPOTIPY_REDIRECT_URI` must be reachable from the machine running the script and registered in your Spotify app's dashboard.
+
+### Usage
+
+```bash
+python backfill_playlist_from_channel.py
+```
+
+Expected log output:
+```text
+2026-08-17 22:10:03 [INFO] Logged in as Spotify Notifier#1234
+2026-08-17 22:10:03 [INFO] Scanning full channel history for Spotify track links... (this may take a while)
+2026-08-17 22:10:41 [INFO] Finished scanning 1287 messages. Found 46 unique Spotify track link(s).
+2026-08-17 22:10:42 [INFO] Fetching current playlist contents to skip duplicates...
+2026-08-17 22:10:43 [INFO] 12 new track(s) to add (skipping 34 already in the playlist).
+2026-08-17 22:10:44 [INFO] Added batch of 12 track(s) to playlist.
+2026-08-17 22:10:44 [INFO] Done. Added 12 track(s) to the playlist.
+```
+
+For very large channels, scanning the full history can take a while — the script logs progress every 500 messages so you can see it's still working.
 
 ---
 
