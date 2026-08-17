@@ -1,13 +1,36 @@
 import os
+from threading import Thread
 import discord
 from discord.ext import commands, tasks
+from flask import Flask
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configuration
+# --- Flask Keep-Alive Web Server ---
+app = Flask("")
+
+
+@app.route("/")
+def home():
+    return "Bot is online!"
+
+
+def run_webserver():
+    # Render assigns dynamic PORT numbers via environment variable
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+
+def keep_alive():
+    t = Thread(target=run_webserver)
+    t.daemon = True
+    t.start()
+
+
+# --- Configuration ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 RAW_PLAYLIST_ID = os.getenv("SPOTIFY_PLAYLIST_ID", "")
@@ -29,7 +52,7 @@ sp_oauth = SpotifyOAuth(
     redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI"),
     scope="playlist-read-private playlist-read-collaborative",
     cache_path=cache_file_path,
-    open_browser=True
+    open_browser=False
 )
 sp = spotipy.Spotify(auth_manager=sp_oauth)
 
@@ -126,4 +149,5 @@ async def before_check():
 
 
 if __name__ == "__main__":
+    keep_alive()
     bot.run(DISCORD_TOKEN)
