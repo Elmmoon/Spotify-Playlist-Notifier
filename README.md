@@ -10,10 +10,11 @@ Also includes a standalone **backfill script** that scans a channel's entire mes
 
 ## 📋 Features
 
-- 🎧 **Live Playlist Monitoring:** Periodically checks Spotify playlists for newly added songs.
+- 🎧 **Live Playlist Monitoring:** Periodically checks Spotify playlists for newly added songs, using a lightweight snapshot check before doing a full track scan.
 - 💬 **Rich Discord Embeds:** Automatically posts track details including song title, artist name, direct Spotify link, and album artwork.
+- 🛡️ **Self-Healing:** A temporarily unreachable Spotify API (e.g. rate-limiting) or a misconfigured/deleted Discord channel no longer requires a manual restart — the bot logs the issue and keeps retrying automatically. Individual failures are retried a bounded number of times, then dropped and logged, so one bad track or outage can't jam the whole notification queue.
 - ⚡ **24/7 Uptime (Set & Forget):** Runs on Render with a lightweight background Flask endpoint pinged every 5 minutes by `cron-job.org` to prevent idle sleeping.
-- 🔐 **Headless OAuth Authentication:** Utilizes a persistent Spotify Refresh Token so server deployments never require manual browser authentication or interactive terminal input.
+- 🔐 **Headless OAuth Authentication:** Uses a persistent Spotify Refresh Token, so server deployments never need manual browser auth or terminal input.
 - 🔎 **Channel Backfill:** One-off script that scans full channel history for Spotify track links (including auto-embeds) and adds any missing tracks to the playlist, skipping ones already there.
 
 ---
@@ -58,6 +59,8 @@ Before getting started, make sure you have:
 | `SPOTIFY_REFRESH_TOKEN` | Stored long-lived Spotify OAuth refresh token (used by `notify.py`, read-only scopes) | `AQB3x8Z...` |
 | `SPOTIPY_CACHE_PATH` | *(Optional)* Cache file path used by `backfill_playlist_from_channel.py` for its own OAuth token | `.cache-backfill` |
 | `PORT` | Web server port (automatically populated on Render) | `8080` |
+
+`notify.py` validates `DISCORD_TOKEN`, `DISCORD_CHANNEL_ID`, and the Spotify refresh token at startup and exits immediately with a clear error if any are missing or invalid, rather than failing later with a confusing crash.
 
 ---
 
@@ -155,6 +158,7 @@ Because cloud hosting platforms (like Render) operate in "headless" environments
 1. The bot runs on Render with `open_browser=False`.
 2. It uses the `SPOTIFY_REFRESH_TOKEN` from your environment variables to authenticate.
 3. Whenever the 60-minute Access Token expires, `spotipy` automatically uses the Refresh Token to fetch a brand new Access Token in the background without requiring user intervention.
+4. On startup, and again on every 2-minute poll if startup didn't succeed (e.g. Spotify rate-limited the initial request), the bot seeds its known-tracks list from the playlist before it will post anything — this prevents both a crash-on-boot and a flood of "new" tracks once the API becomes reachable again.
 
 `backfill_playlist_from_channel.py` works differently since it's meant to be run locally/interactively rather than deployed headlessly: it lets `spotipy` manage its own OAuth flow and token cache directly (see next section), so there's no manual refresh-token copy/paste step for it.
 
@@ -180,7 +184,7 @@ This cache file is separate from anything `notify.py`/`get_refresh_token.py` use
 
 ### Requirements
 
-- The bot needs the **Message Content Intent** enabled in the Discord Developer Portal (same requirement as `notify.py`).
+- The bot needs the **Message Content Intent** enabled in the Discord Developer Portal (only this script needs it — `notify.py` does not).
 - The bot needs **View Channel** and **Read Message History** permissions in the target channel.
 - `SPOTIPY_REDIRECT_URI` must be reachable from the machine running the script and registered in your Spotify app's dashboard.
 
@@ -215,10 +219,21 @@ python notify.py
 
 Expected log output:
 ```text
-2026-08-17 18:08:55 [INFO] Bot connected to Discord as Spotify Notifier (1538915272424169614)
-2026-08-17 18:08:56 [INFO] Successfully pre-loaded 8 existing tracks.
-2026-08-17 18:09:56 [INFO] Checking Spotify playlist for changes...
-2026-08-17 18:09:56 [INFO] No new tracks found.
+2026-08-18 09:00:00 [INFO] Running initialization and pre-loading data...
+2026-08-18 09:00:01 [INFO] Pre-load successful: 8 existing tracks seeded (snapshot=AAAAB3Nl...).
+2026-08-18 09:00:01 [INFO] Discord pusher task started and waiting for songs...
+2026-08-18 09:00:01 [INFO] Bot successfully connected to Discord as Spotify Notifier (1538915272424169614)
+2026-08-18 09:02:01 [INFO] Checking Spotify playlist for changes... [tracks_known=8, queue_size=0, last_snapshot=AAAAB3Nl...]
+2026-08-18 09:02:01 [INFO] No changes detected (snapshot still AAAAB3Nl...). Skipping full track scan.
+```
+
+If Spotify is temporarily unreachable at startup (e.g. rate-limited), the bot logs it, stays online, and retries pre-load automatically every 2 minutes instead of crashing:
+```text
+2026-08-18 09:00:01 [WARNING] Pre-load attempt 1/5 failed.
+2026-08-18 09:00:16 [WARNING] Pre-load attempt 2/5 failed.
+2026-08-18 09:01:31 [WARNING] Pre-load still incomplete after startup retries; will keep retrying via poll loop.
+2026-08-18 09:02:01 [WARNING] Initial pre-load has not completed yet. Retrying now...
+2026-08-18 09:02:02 [INFO] Pre-load successful: 8 existing tracks seeded (snapshot=AAAAB3Nl...).
 ```
 
 ---
