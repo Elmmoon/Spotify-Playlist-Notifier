@@ -141,7 +141,9 @@ async def preload_playlist_state() -> bool:
 
     last_snapshot_id = snapshot
     for item in items:
-        track = item.get("track")
+        # "item" fallback: some playlist item shapes (e.g. episodes/local
+        # files) key the track data under "item" instead of "track".
+        track = item.get("track") or item.get("item")
         if track and track.get("id"):
             seen_track_ids.add(track["id"])
 
@@ -262,7 +264,9 @@ async def check_playlist_changes():
         new_tracks_found = 0
 
         for item in items:
-            track = item.get("track")
+            # "item" fallback: some playlist item shapes (e.g. episodes/local
+            # files) key the track data under "item" instead of "track".
+            track = item.get("track") or item.get("item")
             if not track or not track.get("id"):
                 continue
 
