@@ -107,8 +107,9 @@ consecutive_preload_failures = 0
 
 MAX_SEND_RETRIES = 3
 MAX_CHANNEL_RETRIES = 3
-SEND_RETRY_BASE_DELAY = 5
-SEND_RETRY_MAX_DELAY = 60
+SEND_RETRY_BASE_DELAY = 0.5
+SEND_RETRY_MAX_DELAY = 4
+SEND_PUSH_DELAY = 0.1
 PRELOAD_FAILURE_ALERT_THRESHOLD = 10
 preload_failure_alerted = False
 
@@ -227,7 +228,7 @@ async def discord_pusher():
                 logging.error(f"Dropping track {track_id} after {MAX_SEND_RETRIES} failed attempts: {e}")
 
         song_queue.task_done()
-        await asyncio.sleep(2.5)
+        await asyncio.sleep(SEND_PUSH_DELAY)
 
 # --- PRODUCER: Spotify watcher ---
 @tasks.loop(minutes=2)
