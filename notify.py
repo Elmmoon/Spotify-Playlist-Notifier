@@ -66,13 +66,10 @@ if refresh_token:
 
 sp = spotipy.Spotify(auth_manager=auth_manager)
 
-# --- Discord Bot Setup ---
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-
+# --- Globals & Buffer ---
 seen_track_ids = set()
 last_snapshot_id = None
+song_queue = asyncio.Queue() # Unbounded buffer
 
 # --- Blocking Spotify API Helper Functions ---
 def fetch_playlist_snapshot_blocking():
@@ -104,39 +101,59 @@ async def get_playlist_snapshot():
 async def get_playlist_tracks():
     return await asyncio.to_thread(fetch_all_playlist_tracks_blocking)
 
-@bot.event
-async def on_ready():
-    global last_snapshot_id
-    logging.info(f"Bot connected to Discord as {bot.user.name} ({bot.user.id})")
-    try:
-        last_snapshot_id = await get_playlist_snapshot()
-        initial_items = await get_playlist_tracks()
+
+# --- CONSUMER: Discord Pusher (Zero-Overhead loop) ---
+async def discord_pusher():
+    await bot.wait_until_ready()
+    logging.info("Discord pusher task started and waiting for songs...")
+    
+    while not bot.is_closed():
+        # Suspends entirely until the Producer adds a song to the queue
+        track = await song_queue.get()
         
-        for item in initial_items:
-            track = item.get("track") or item.get("item")
-            if track and track.get("id"):
-                seen_track_ids.add(track["id"])
-                
-        logging.info(f"Successfully pre-loaded {len(seen_track_ids)} existing tracks (Snapshot: {last_snapshot_id}).")
-    except Exception as e:
-        logging.error(f"Error during initial track load: {e}")
+        channel = bot.get_channel(CHANNEL_ID)
+        if not channel:
+            logging.warning("Discord channel not found. Retrying in 10s...")
+            await song_queue.put(track)
+            await asyncio.sleep(10)
+            continue
+            
+        try:
+            track_name = track.get("name", "Unknown Title")
+            artists = track.get("artists", [])
+            artist_name = artists[0]["name"] if artists else "Unknown Artist"
+            track_url = track.get("external_urls", {}).get("spotify", "")
+            images = track.get("album", {}).get("images", [])
+            thumbnail_url = images[0]["url"] if images else None
 
-    if not check_playlist_changes.is_running():
-        check_playlist_changes.start()
+            embed = discord.Embed(
+                title="🎶 New Song Added to Playlist!",
+                description=f"**[{track_name}]({track_url})**\nby **{artist_name}**",
+                color=discord.Color.green()
+            )
+            if thumbnail_url:
+                embed.set_thumbnail(url=thumbnail_url)
 
-# Polling every 2 minutes with robust exception catching
+            await channel.send(embed=embed)
+            logging.info(f"Pushed to Discord: '{track_name}'")
+            
+        except Exception as e:
+            logging.error(f"Consumer error pushing to Discord: {e}")
+            await song_queue.put(track)
+            
+        finally:
+            song_queue.task_done()
+            # Enforce strict pacing to completely avoid Discord rate limits
+            await asyncio.sleep(2.5)
+
+
+# --- PRODUCER: Spotify Watcher ---
 @tasks.loop(minutes=2)
 async def check_playlist_changes():
     global last_snapshot_id
     logging.info("Checking Spotify playlist for changes...")
-    
-    channel = bot.get_channel(CHANNEL_ID)
-    if not channel:
-        logging.warning(f"Could not find Discord channel with ID {CHANNEL_ID}")
-        return
 
     try:
-        # Step 1: Lightweight check to see if the playlist changed at all (1 request)
         current_snapshot = await get_playlist_snapshot()
         
         if not current_snapshot:
@@ -147,7 +164,6 @@ async def check_playlist_changes():
             logging.info("No changes detected (Snapshot ID matches). Skipping full track scan.")
             return
 
-        # Step 2: If snapshot changed, perform full pagination scan
         logging.info("Playlist change detected via snapshot ID! Fetching updated tracks...")
         items = await get_playlist_tracks()
         new_tracks_found = 0
@@ -162,30 +178,15 @@ async def check_playlist_changes():
             if track_id not in seen_track_ids:
                 seen_track_ids.add(track_id)
                 new_tracks_found += 1
-
-                track_name = track.get("name", "Unknown Title")
-                artists = track.get("artists", [])
-                artist_name = artists[0]["name"] if artists else "Unknown Artist"
-                track_url = track.get("external_urls", {}).get("spotify", "")
                 
-                images = track.get("album", {}).get("images", [])
-                thumbnail_url = images[0]["url"] if images else None
+                # Push the track object into the queue for the Consumer
+                await song_queue.put(track)
 
-                embed = discord.Embed(
-                    title="🎶 New Song Added to Playlist!",
-                    description=f"**[{track_name}]({track_url})**\nby **{artist_name}**",
-                    color=discord.Color.green()
-                )
-                if thumbnail_url:
-                    embed.set_thumbnail(url=thumbnail_url)
-
-                await channel.send(embed=embed)
-                logging.info(f"Posted new track: '{track_name}' by '{artist_name}'")
-
-        # Update snapshot reference tracking
         last_snapshot_id = current_snapshot
 
-        if new_tracks_found == 0:
+        if new_tracks_found > 0:
+            logging.info(f"Producer pushed {new_tracks_found} new tracks into the buffer.")
+        else:
             logging.info("Snapshot changed, but no new unique tracks were added.")
 
     except Exception as e:
@@ -194,6 +195,49 @@ async def check_playlist_changes():
 @check_playlist_changes.before_loop
 async def before_check():
     await bot.wait_until_ready()
+
+
+# --- Discord Bot Setup & Initialization ---
+intents = discord.Intents.default()
+intents.message_content = True
+
+class SpotifyBot(commands.Bot):
+    async def setup_hook(self):
+        """
+        setup_hook runs exactly once during bot startup.
+        It is immune to the WebSocket reconnection issues of on_ready.
+        """
+        global last_snapshot_id
+        logging.info("Running initialization and pre-loading data...")
+        
+        # 1. Pre-load existing tracks so we don't spam the channel on startup
+        try:
+            last_snapshot_id = await get_playlist_snapshot()
+            initial_items = await get_playlist_tracks()
+            
+            for item in initial_items:
+                track = item.get("track") or item.get("item")
+                if track and track.get("id"):
+                    seen_track_ids.add(track["id"])
+                    
+            logging.info(f"Successfully pre-loaded {len(seen_track_ids)} existing tracks (Snapshot: {last_snapshot_id}).")
+        except Exception as e:
+            logging.error(f"Error during initial track load: {e}")
+
+        # 2. Start the Consumer background task
+        self.loop.create_task(discord_pusher())
+
+        # 3. Start the Producer loop
+        check_playlist_changes.start()
+
+# Instantiate the bot using our custom class
+bot = SpotifyBot(command_prefix="!", intents=intents)
+
+@bot.event
+async def on_ready():
+    # on_ready is now purely for letting us know it successfully connected/reconnected
+    logging.info(f"Bot successfully connected to Discord as {bot.user.name} ({bot.user.id})")
+
 
 if __name__ == "__main__":
     keep_alive()
