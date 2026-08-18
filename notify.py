@@ -107,17 +107,75 @@ consecutive_preload_failures = 0
 
 MAX_SEND_RETRIES = 3
 MAX_CHANNEL_RETRIES = 3
-SEND_RETRY_BASE_DELAY = 5
-SEND_RETRY_MAX_DELAY = 60
+SEND_RETRY_BASE_DELAY = 2
+SEND_RETRY_MAX_DELAY = 8
 PRELOAD_FAILURE_ALERT_THRESHOLD = 10
 preload_failure_alerted = False
 
-song_queue = asyncio.Queue()  # {"track": <dict>, "retries": <int>}
+MAX_BATCH_TRACKS = 25
+MAX_BATCH_CHARS = 5800
+
+song_queue = asyncio.Queue()  # {"tracks": <list>, "retries": <int>}
 
 # --- Helpers ---
 def extract_track(item: dict):
     """Return the track from common playlist item shapes."""
     return item.get("track") or item.get("item")
+
+def add_track_to_embed(embed, track):
+    track_name = track.get("name") or "Unknown Title"
+    artists = track.get("artists") or []
+    artist_name = artists[0]["name"] if artists else "Unknown Artist"
+    track_url = (track.get("external_urls") or {}).get("spotify", "")
+
+    value = f"by **{artist_name}**"
+    if track_url:
+        value += f"\n[Spotify]({track_url})"
+
+    current_chars = len(embed.title or "") + len(embed.description or "")
+    current_chars += sum(len(field.name) + len(field.value) for field in embed.fields)
+
+    if len(embed.fields) >= MAX_BATCH_TRACKS:
+        return False
+
+    if current_chars + len(track_name) + len(value) > MAX_BATCH_CHARS:
+        return False
+
+    embed.add_field(
+        name=f"🎵 {track_name}",
+        value=value,
+        inline=False
+    )
+    return True
+
+def make_batches(tracks):
+    batches = []
+    current = []
+    embed = discord.Embed(
+        title="🎶 New Songs Added to Playlist!",
+        color=discord.Color.green()
+    )
+
+    for track in tracks:
+        if add_track_to_embed(embed, track):
+            current.append(track)
+        else:
+            if current:
+                batches.append(current)
+
+            current = []
+            embed = discord.Embed(
+                title="🎶 New Songs Added to Playlist!",
+                color=discord.Color.green()
+            )
+
+            add_track_to_embed(embed, track)
+            current.append(track)
+
+    if current:
+        batches.append(current)
+
+    return batches
 
 # --- Spotify calls ---
 def fetch_playlist_snapshot_blocking():
@@ -183,7 +241,7 @@ async def discord_pusher():
 
     while not bot.is_closed():
         item = await song_queue.get()
-        track = item["track"]
+        tracks = item["tracks"]
         retries = item.get("retries", 0)
 
         try:
@@ -191,43 +249,38 @@ async def discord_pusher():
             if not channel:
                 raise RuntimeError(f"Discord channel {CHANNEL_ID} not found")
 
-            track_name = track.get("name") or "Unknown Title"
-            artists = track.get("artists") or []
-            artist_name = artists[0]["name"] if artists else "Unknown Artist"
-            track_url = (track.get("external_urls") or {}).get("spotify", "")
-            images = (track.get("album") or {}).get("images") or []
-            thumbnail_url = images[0]["url"] if images else None
-
             embed = discord.Embed(
-                title="🎶 New Song Added to Playlist!",
-                description=f"**[{track_name}]({track_url})**\nby **{artist_name}**",
+                title="🎶 New Songs Added to Playlist!",
                 color=discord.Color.green()
             )
-            if thumbnail_url:
-                embed.set_thumbnail(url=thumbnail_url)
+
+            for track in tracks:
+                add_track_to_embed(embed, track)
 
             await channel.send(embed=embed)
-            logging.info(f"Pushed to Discord: '{track_name}'")
+            logging.info(f"Pushed {len(tracks)} new track(s) to Discord.")
 
         except (discord.Forbidden, discord.NotFound) as e:
-            track_id = track.get("id", "unknown")
-            logging.error(f"Permanent Discord error for track {track_id}; dropping: {e}")
+            track_ids = [track.get("id", "unknown") for track in tracks]
+            logging.error(f"Permanent Discord error for tracks {track_ids}; dropping: {e}")
 
         except Exception as e:
             if retries < MAX_SEND_RETRIES:
                 delay = min(SEND_RETRY_BASE_DELAY * (2 ** retries), SEND_RETRY_MAX_DELAY)
                 logging.warning(
-                    f"Discord send failed for '{track.get('name', 'Unknown Title')}' "
+                    f"Discord send failed for batch of {len(tracks)} track(s) "
                     f"(attempt {retries + 1}/{MAX_SEND_RETRIES}); retrying in {delay}s: {e}"
                 )
                 await asyncio.sleep(delay)
-                await song_queue.put({"track": track, "retries": retries + 1})
+                await song_queue.put({"tracks": tracks, "retries": retries + 1})
             else:
-                track_id = track.get("id", "unknown")
-                logging.error(f"Dropping track {track_id} after {MAX_SEND_RETRIES} failed attempts: {e}")
+                track_ids = [track.get("id", "unknown") for track in tracks]
+                logging.error(
+                    f"Dropping tracks {track_ids} after {MAX_SEND_RETRIES} failed attempts: {e}"
+                )
 
         song_queue.task_done()
-        await asyncio.sleep(2.5)
+        await asyncio.sleep(1)
 
 # --- PRODUCER: Spotify watcher ---
 @tasks.loop(minutes=2)
@@ -285,7 +338,7 @@ async def check_playlist_changes():
             logging.warning("Track fetch failed; keeping the current snapshot.")
             return
 
-        new_tracks_found = 0
+        new_tracks = []
 
         for item in items:
             track = extract_track(item)
@@ -296,13 +349,19 @@ async def check_playlist_changes():
 
             if track_id not in seen_track_ids:
                 seen_track_ids.add(track_id)
-                new_tracks_found += 1
-                await song_queue.put({"track": track, "retries": 0})
+                new_tracks.append(track)
 
         last_snapshot_id = current_snapshot
 
-        if new_tracks_found > 0:
-            logging.info(f"Queued {new_tracks_found} new tracks.")
+        if new_tracks:
+            batches = make_batches(new_tracks)
+
+            for batch in batches:
+                await song_queue.put({"tracks": batch, "retries": 0})
+
+            logging.info(
+                f"Queued {len(new_tracks)} new tracks in {len(batches)} message(s)."
+            )
         else:
             logging.info("Snapshot changed; no new tracks found.")
 
