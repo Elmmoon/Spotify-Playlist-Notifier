@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 import asyncio
 from threading import Thread
@@ -41,8 +42,23 @@ def keep_alive():
 
 # --- Configuration ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
+RAW_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
 RAW_PLAYLIST_ID = os.getenv("SPOTIFY_PLAYLIST_ID", "")
+
+# --- Fail fast with clear errors instead of cryptic crashes deep in library code ---
+if not DISCORD_TOKEN:
+    logging.error("DISCORD_TOKEN is not set. Set it in your environment or .env file.")
+    sys.exit(1)
+
+if not RAW_CHANNEL_ID:
+    logging.error("DISCORD_CHANNEL_ID is not set. Set it in your environment or .env file.")
+    sys.exit(1)
+
+try:
+    CHANNEL_ID = int(RAW_CHANNEL_ID)
+except ValueError:
+    logging.error(f"DISCORD_CHANNEL_ID must be an integer, got: {RAW_CHANNEL_ID!r}")
+    sys.exit(1)
 
 def extract_playlist_id(raw_id: str) -> str:
     if "playlist/" in raw_id:
@@ -62,14 +78,23 @@ auth_manager = SpotifyOAuth(
 
 refresh_token = os.getenv("SPOTIFY_REFRESH_TOKEN")
 if refresh_token:
-    auth_manager.refresh_access_token(refresh_token)
+    try:
+        auth_manager.refresh_access_token(refresh_token)
+    except Exception as e:
+        logging.error(f"Failed to refresh Spotify access token at startup: {e}")
+        logging.error("Check that SPOTIFY_REFRESH_TOKEN is valid and not revoked.")
+        sys.exit(1)
 
 sp = spotipy.Spotify(auth_manager=auth_manager)
 
 # --- Globals & Buffer ---
 seen_track_ids = set()
 last_snapshot_id = None
-song_queue = asyncio.Queue() # Unbounded buffer
+song_queue = asyncio.Queue()  # Unbounded buffer of {"track": <dict>, "retries": <int>}
+preload_complete = False  # becomes True once initial playlist state is seeded
+
+MAX_SEND_RETRIES = 3  # cap on re-queueing a track after a send failure
+MAX_CHANNEL_RETRIES = 3  # cap on re-queueing a track if the channel is unreachable
 
 # --- Blocking Spotify API Helper Functions ---
 def fetch_playlist_snapshot_blocking():
@@ -81,6 +106,10 @@ def fetch_playlist_snapshot_blocking():
         return None
 
 def fetch_all_playlist_tracks_blocking():
+    """Returns the full list of playlist items, or None if the fetch failed
+    partway through pagination. Returning None (rather than the partial list
+    gathered so far) lets callers distinguish "failed fetch" from "genuinely
+    empty playlist" and avoid treating a truncated read as complete."""
     all_items = []
     try:
         results = sp.playlist_items(SPOTIFY_PLAYLIST_ID)
@@ -90,9 +119,10 @@ def fetch_all_playlist_tracks_blocking():
                 results = sp.next(results)
             else:
                 break
+        return all_items
     except Exception as e:
         logging.error(f"Spotify API Tracks Error: {e}")
-    return all_items
+        return None
 
 # --- Async Wrappers ---
 async def get_playlist_snapshot():
@@ -102,28 +132,72 @@ async def get_playlist_tracks():
     return await asyncio.to_thread(fetch_all_playlist_tracks_blocking)
 
 
+async def preload_playlist_state() -> bool:
+    """Seed last_snapshot_id and seen_track_ids from the current playlist
+    WITHOUT queueing anything for Discord (this is a silent baseline, not a
+    diff). Returns True on success, False on failure (e.g. rate-limited by
+    Spotify) so the caller can retry later instead of treating it as fatal."""
+    global last_snapshot_id
+
+    snapshot = await get_playlist_snapshot()
+    items = await get_playlist_tracks()
+
+    if snapshot is None or items is None:
+        logging.warning("Pre-load fetch failed (snapshot or tracks unavailable).")
+        return False
+
+    last_snapshot_id = snapshot
+    for item in items:
+        track = item.get("track")
+        if track and track.get("id"):
+            seen_track_ids.add(track["id"])
+
+    logging.info(
+        f"Pre-load successful: {len(seen_track_ids)} existing tracks seeded "
+        f"(snapshot={last_snapshot_id})."
+    )
+    return True
+
+
 # --- CONSUMER: Discord Pusher (Zero-Overhead loop) ---
 async def discord_pusher():
     await bot.wait_until_ready()
     logging.info("Discord pusher task started and waiting for songs...")
-    
+
     while not bot.is_closed():
         # Suspends entirely until the Producer adds a song to the queue
-        track = await song_queue.get()
-        
+        item = await song_queue.get()
+        track = item["track"]
+        retries = item.get("retries", 0)
+
         channel = bot.get_channel(CHANNEL_ID)
         if not channel:
-            logging.warning("Discord channel not found. Retrying in 10s...")
-            await song_queue.put(track)
+            # discord.py's cache is kept in sync by gateway events (channel
+            # deletes, the bot being kicked, etc.), so a cache miss here is a
+            # real, not stale, signal -- no need for an extra fetch_channel()
+            # API call. Cap retries so a permanently invalid channel (deleted,
+            # bot kicked) can't loop forever and silently swallow every track.
+            if retries < MAX_CHANNEL_RETRIES:
+                logging.warning(
+                    f"Discord channel {CHANNEL_ID} not found "
+                    f"(attempt {retries + 1}/{MAX_CHANNEL_RETRIES}). Retrying in 10s..."
+                )
+                await song_queue.put({"track": track, "retries": retries + 1})
+            else:
+                logging.error(
+                    f"Channel {CHANNEL_ID} still unreachable after {MAX_CHANNEL_RETRIES} "
+                    f"attempts. Dropping track '{track.get('name', 'Unknown Title')}'."
+                )
+            song_queue.task_done()
             await asyncio.sleep(10)
             continue
-            
+
         try:
-            track_name = track.get("name", "Unknown Title")
-            artists = track.get("artists", [])
+            track_name = track.get("name") or "Unknown Title"
+            artists = track.get("artists") or []
             artist_name = artists[0]["name"] if artists else "Unknown Artist"
-            track_url = track.get("external_urls", {}).get("spotify", "")
-            images = track.get("album", {}).get("images", [])
+            track_url = (track.get("external_urls") or {}).get("spotify", "")
+            images = (track.get("album") or {}).get("images") or []
             thumbnail_url = images[0]["url"] if images else None
 
             embed = discord.Embed(
@@ -136,11 +210,20 @@ async def discord_pusher():
 
             await channel.send(embed=embed)
             logging.info(f"Pushed to Discord: '{track_name}'")
-            
+
         except Exception as e:
-            logging.error(f"Consumer error pushing to Discord: {e}")
-            await song_queue.put(track)
-            
+            if retries < MAX_SEND_RETRIES:
+                logging.error(
+                    f"Consumer error pushing track (attempt {retries + 1}/{MAX_SEND_RETRIES}): {e}"
+                )
+                await song_queue.put({"track": track, "retries": retries + 1})
+            else:
+                # Give up on this track rather than jamming the queue forever.
+                track_id = track.get("id", "unknown")
+                logging.error(
+                    f"Dropping track {track_id} after {MAX_SEND_RETRIES} failed attempts: {e}"
+                )
+
         finally:
             song_queue.task_done()
             # Enforce strict pacing to completely avoid Discord rate limits
@@ -150,26 +233,57 @@ async def discord_pusher():
 # --- PRODUCER: Spotify Watcher ---
 @tasks.loop(minutes=2)
 async def check_playlist_changes():
-    global last_snapshot_id
-    logging.info("Checking Spotify playlist for changes...")
+    global last_snapshot_id, preload_complete
+    logging.info(
+        f"Checking Spotify playlist for changes... "
+        f"[tracks_known={len(seen_track_ids)}, queue_size={song_queue.qsize()}, "
+        f"last_snapshot={last_snapshot_id}]"
+    )
+
+    # If initial pre-load never succeeded at startup (e.g. Spotify rate-limited
+    # us), retry it here on the normal 2-minute cadence instead of giving up.
+    # This is a silent seed, not a diff, so it must NOT fall through into the
+    # change-detection logic below on the same cycle (that would compare
+    # against the snapshot we just set and correctly find "no changes" anyway,
+    # but returning early keeps the two code paths cleanly separated).
+    if not preload_complete:
+        logging.warning("Initial pre-load has not completed yet. Retrying now...")
+        preload_complete = await preload_playlist_state()
+        if not preload_complete:
+            logging.warning(
+                "Pre-load still failing (likely Spotify rate-limiting). "
+                "Will retry again on the next 2-minute cycle."
+            )
+        return
 
     try:
         current_snapshot = await get_playlist_snapshot()
-        
+
         if not current_snapshot:
             logging.warning("Could not retrieve current snapshot ID. Skipping this cycle.")
             return
 
         if current_snapshot == last_snapshot_id:
-            logging.info("No changes detected (Snapshot ID matches). Skipping full track scan.")
+            logging.info(f"No changes detected (snapshot still {current_snapshot}). Skipping full track scan.")
             return
 
-        logging.info("Playlist change detected via snapshot ID! Fetching updated tracks...")
+        logging.info(
+            f"Playlist change detected (snapshot {last_snapshot_id} -> {current_snapshot})! "
+            f"Fetching updated tracks..."
+        )
         items = await get_playlist_tracks()
+
+        if items is None:
+            # Fetch failed (possibly partway through pagination). Do NOT advance
+            # last_snapshot_id here, or a truncated read would be treated as
+            # complete and any tracks past the failure point would be lost forever.
+            logging.warning("Track fetch failed; skipping this cycle without updating snapshot.")
+            return
+
         new_tracks_found = 0
 
         for item in items:
-            track = item.get("track") or item.get("item")
+            track = item.get("track")
             if not track or not track.get("id"):
                 continue
 
@@ -178,9 +292,9 @@ async def check_playlist_changes():
             if track_id not in seen_track_ids:
                 seen_track_ids.add(track_id)
                 new_tracks_found += 1
-                
+
                 # Push the track object into the queue for the Consumer
-                await song_queue.put(track)
+                await song_queue.put({"track": track, "retries": 0})
 
         last_snapshot_id = current_snapshot
 
@@ -199,7 +313,12 @@ async def before_check():
 
 # --- Discord Bot Setup & Initialization ---
 intents = discord.Intents.default()
-intents.message_content = True
+# Note: message_content is a privileged intent and isn't used anywhere in this
+# bot (no on_message handler, no prefix commands read message text), so it's
+# left disabled to avoid requesting privileges the bot doesn't need.
+
+MAX_PRELOAD_ATTEMPTS = 5
+PRELOAD_RETRY_DELAY_SECONDS = 15
 
 class SpotifyBot(commands.Bot):
     async def setup_hook(self):
@@ -207,27 +326,35 @@ class SpotifyBot(commands.Bot):
         setup_hook runs exactly once during bot startup.
         It is immune to the WebSocket reconnection issues of on_ready.
         """
-        global last_snapshot_id
+        global preload_complete
         logging.info("Running initialization and pre-loading data...")
-        
-        # 1. Pre-load existing tracks so we don't spam the channel on startup
-        try:
-            last_snapshot_id = await get_playlist_snapshot()
-            initial_items = await get_playlist_tracks()
-            
-            for item in initial_items:
-                track = item.get("track") or item.get("item")
-                if track and track.get("id"):
-                    seen_track_ids.add(track["id"])
-                    
-            logging.info(f"Successfully pre-loaded {len(seen_track_ids)} existing tracks (Snapshot: {last_snapshot_id}).")
-        except Exception as e:
-            logging.error(f"Error during initial track load: {e}")
+
+        # 1. Try to pre-load existing tracks so we don't spam the channel on
+        #    startup. A short burst of retries here covers quick transient
+        #    errors, but if Spotify is still unreachable (e.g. we're
+        #    rate-limited) we do NOT block startup or shut the bot down --
+        #    check_playlist_changes will keep retrying pre-load every 2
+        #    minutes until it succeeds.
+        for attempt in range(1, MAX_PRELOAD_ATTEMPTS + 1):
+            preload_complete = await preload_playlist_state()
+            if preload_complete:
+                break
+            logging.warning(f"Pre-load attempt {attempt}/{MAX_PRELOAD_ATTEMPTS} failed.")
+            if attempt < MAX_PRELOAD_ATTEMPTS:
+                await asyncio.sleep(PRELOAD_RETRY_DELAY_SECONDS)
+
+        if not preload_complete:
+            logging.warning(
+                "Could not pre-load playlist state at startup (likely rate-limited "
+                "by Spotify). Bot will keep running and retry pre-load automatically "
+                "every 2 minutes via the normal poll cycle."
+            )
 
         # 2. Start the Consumer background task
         self.loop.create_task(discord_pusher())
 
-        # 3. Start the Producer loop
+        # 3. Start the Producer loop regardless of pre-load outcome -- it
+        #    will retry pre-load itself on its first tick(s) if needed.
         check_playlist_changes.start()
 
 # Instantiate the bot using our custom class
