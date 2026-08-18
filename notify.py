@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from threading import Thread
 import discord
 from discord.ext import commands, tasks
@@ -50,7 +51,7 @@ def extract_playlist_id(raw_id: str) -> str:
 
 SPOTIFY_PLAYLIST_ID = extract_playlist_id(RAW_PLAYLIST_ID)
 
-# --- Spotify API Setup (Uses Refresh Token for Server Deployments) ---
+# --- Spotify API Setup ---
 auth_manager = SpotifyOAuth(
     client_id=os.getenv("SPOTIPY_CLIENT_ID"),
     client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
@@ -59,7 +60,6 @@ auth_manager = SpotifyOAuth(
     open_browser=False
 )
 
-# Inject the stored refresh token directly
 refresh_token = os.getenv("SPOTIFY_REFRESH_TOKEN")
 if refresh_token:
     auth_manager.refresh_access_token(refresh_token)
@@ -72,8 +72,19 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 seen_track_ids = set()
+last_snapshot_id = None
 
-def get_playlist_tracks():
+# --- Blocking Spotify API Helper Functions ---
+def fetch_playlist_snapshot_blocking():
+    # Fetch just the playlist metadata to check its snapshot ID (1 fast request)
+    try:
+        playlist_meta = sp.playlist(SPOTIFY_PLAYLIST_ID, fields="snapshot_id")
+        return playlist_meta.get("snapshot_id")
+    except Exception as e:
+        logging.error(f"Spotify API Metadata Error: {e}")
+        return None
+
+def fetch_all_playlist_tracks_blocking():
     all_items = []
     try:
         results = sp.playlist_items(SPOTIFY_PLAYLIST_ID)
@@ -84,35 +95,59 @@ def get_playlist_tracks():
             else:
                 break
     except Exception as e:
-        logging.error(f"Spotify API Error: {e}")
+        logging.error(f"Spotify API Tracks Error: {e}")
     return all_items
+
+# --- Async Wrappers ---
+async def get_playlist_snapshot():
+    return await asyncio.to_thread(fetch_playlist_snapshot_blocking)
+
+async def get_playlist_tracks():
+    return await asyncio.to_thread(fetch_all_playlist_tracks_blocking)
 
 @bot.event
 async def on_ready():
+    global last_snapshot_id
     logging.info(f"Bot connected to Discord as {bot.user.name} ({bot.user.id})")
     try:
-        initial_items = get_playlist_tracks()
+        # Initial load gets both snapshot and full tracks
+        last_snapshot_id = await get_playlist_snapshot()
+        initial_items = await get_playlist_tracks()
+        
         for item in initial_items:
             track = item.get("track") or item.get("item")
             if track and track.get("id"):
                 seen_track_ids.add(track["id"])
-        logging.info(f"Successfully pre-loaded {len(seen_track_ids)} existing tracks.")
+                
+        logging.info(f"Successfully pre-loaded {len(seen_track_ids)} existing tracks (Snapshot: {last_snapshot_id}).")
     except Exception as e:
         logging.error(f"Error during initial track load: {e}")
 
     if not check_playlist_changes.is_running():
         check_playlist_changes.start()
 
+# Polling every 2 minutes with snapshot optimization
 @tasks.loop(minutes=2)
 async def check_playlist_changes():
+    global last_snapshot_id
     logging.info("Checking Spotify playlist for changes...")
+    
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         logging.warning(f"Could not find Discord channel with ID {CHANNEL_ID}")
         return
 
     try:
-        items = get_playlist_tracks()
+        # Step 1: Lightweight check to see if the playlist changed at all (1 request)
+        current_snapshot = await get_playlist_snapshot()
+        
+        if current_snapshot and current_snapshot == last_snapshot_id:
+            logging.info("No changes detected (Snapshot ID matches). Skipping full track scan.")
+            return
+
+        # Step 2: If snapshot changed (or failed to load), perform the full 7-request scan
+        logging.info("Playlist change detected via snapshot ID! Fetching updated tracks...")
+        items = await get_playlist_tracks()
         new_tracks_found = 0
 
         for item in items:
@@ -145,8 +180,12 @@ async def check_playlist_changes():
                 await channel.send(embed=embed)
                 logging.info(f"Posted new track: '{track_name}' by '{artist_name}'")
 
+        # Update the stored snapshot tracker
+        if current_snapshot:
+            last_snapshot_id = current_snapshot
+
         if new_tracks_found == 0:
-            logging.info("No new tracks found.")
+            logging.info("Snapshot changed, but no new unique tracks were added.")
 
     except Exception as e:
         logging.error(f"Error checking Spotify playlist loop: {e}")
