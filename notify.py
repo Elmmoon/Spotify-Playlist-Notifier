@@ -45,7 +45,7 @@ CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 RAW_PLAYLIST_ID = os.getenv("SPOTIFY_PLAYLIST_ID", "")
 
 def extract_playlist_id(raw_id: str) -> str:
-    if "spotify.com/playlist/" in raw_id:
+    if "playlist/" in raw_id:
         return raw_id.split("playlist/")[1].split("?")[0]
     return raw_id
 
@@ -76,7 +76,6 @@ last_snapshot_id = None
 
 # --- Blocking Spotify API Helper Functions ---
 def fetch_playlist_snapshot_blocking():
-    # Fetch just the playlist metadata to check its snapshot ID (1 fast request)
     try:
         playlist_meta = sp.playlist(SPOTIFY_PLAYLIST_ID, fields="snapshot_id")
         return playlist_meta.get("snapshot_id")
@@ -110,7 +109,6 @@ async def on_ready():
     global last_snapshot_id
     logging.info(f"Bot connected to Discord as {bot.user.name} ({bot.user.id})")
     try:
-        # Initial load gets both snapshot and full tracks
         last_snapshot_id = await get_playlist_snapshot()
         initial_items = await get_playlist_tracks()
         
@@ -126,7 +124,7 @@ async def on_ready():
     if not check_playlist_changes.is_running():
         check_playlist_changes.start()
 
-# Polling every 2 minutes with snapshot optimization
+# Polling every 2 minutes with robust exception catching
 @tasks.loop(minutes=2)
 async def check_playlist_changes():
     global last_snapshot_id
@@ -141,11 +139,15 @@ async def check_playlist_changes():
         # Step 1: Lightweight check to see if the playlist changed at all (1 request)
         current_snapshot = await get_playlist_snapshot()
         
-        if current_snapshot and current_snapshot == last_snapshot_id:
+        if not current_snapshot:
+            logging.warning("Could not retrieve current snapshot ID. Skipping this cycle.")
+            return
+
+        if current_snapshot == last_snapshot_id:
             logging.info("No changes detected (Snapshot ID matches). Skipping full track scan.")
             return
 
-        # Step 2: If snapshot changed (or failed to load), perform the full 7-request scan
+        # Step 2: If snapshot changed, perform full pagination scan
         logging.info("Playlist change detected via snapshot ID! Fetching updated tracks...")
         items = await get_playlist_tracks()
         new_tracks_found = 0
@@ -180,9 +182,8 @@ async def check_playlist_changes():
                 await channel.send(embed=embed)
                 logging.info(f"Posted new track: '{track_name}' by '{artist_name}'")
 
-        # Update the stored snapshot tracker
-        if current_snapshot:
-            last_snapshot_id = current_snapshot
+        # Update snapshot reference tracking
+        last_snapshot_id = current_snapshot
 
         if new_tracks_found == 0:
             logging.info("Snapshot changed, but no new unique tracks were added.")
