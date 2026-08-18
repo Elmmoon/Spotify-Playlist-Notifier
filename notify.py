@@ -103,7 +103,7 @@ async def on_ready():
     if not check_playlist_changes.is_running():
         check_playlist_changes.start()
 
-@tasks.loop(minutes=1)
+@tasks.loop(minutes=2)
 async def check_playlist_changes():
     logging.info("Checking Spotify playlist for changes...")
     channel = bot.get_channel(CHANNEL_ID)

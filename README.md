@@ -110,7 +110,7 @@ Because server deployments (like Render) run in a headless cloud environment wit
    - **Name:** `spotify-playlist-notifier`
    - **Environment:** `Python 3`
    - **Build Command:** `pip install -r requirements.txt`
-   - **Start Command:** `python notify.py`
+   - **Start Command:** `python -u notify.py`
    - **Instance Type:** `Free`
 5. Click **Environment** under your service settings and add all required keys:
    - `DISCORD_TOKEN`
